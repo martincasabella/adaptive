@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import abc
-from contextlib import suppress
 from copy import deepcopy
 
 from ..utils import save, load
@@ -149,9 +148,8 @@ class BaseLearner(metaclass=abc.ABCMeta):
         See the notes in the `save` doc-string.
         """
         fname = fname or self.fname
-        with suppress(FileNotFoundError, EOFError):
-            data = load(fname, compress)
-            self._set_data(data)
+        data = load(fname, compress)
+        self._set_data(data)
 
     def __getstate__(self):
         return deepcopy(self.__dict__)
