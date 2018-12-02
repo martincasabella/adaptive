@@ -5,6 +5,8 @@ import heapq
 import itertools
 import math
 from collections import Iterable
+from sortedcontainers import SortedKeyList
+import more_itertools
 
 import numpy as np
 import sortedcontainers
@@ -225,9 +227,6 @@ class Learner1D(BaseLearner):
 
         self.loss_per_interval = loss_per_interval or default_loss
 
-        # A dict storing the loss function for each interval x_n.
-        self.losses = {}
-        self.losses_combined = {}
 
         # When the scale changes by a factor 2, the losses are
         # recomputed. This is tunable such that we can test
@@ -249,12 +248,24 @@ class Learner1D(BaseLearner):
         self._scale = [bounds[1] - bounds[0], 0]
         self._oldscale = deepcopy(self._scale)
 
+        # A LossManager storing the loss function for each interval x_n.
+        self._losses = LossManager(self._scale[0])
+        self._losses_combined = LossManager(self._scale[0])
+
         # The precision in 'x' below which we set losses to 0.
         self._dx_eps = 2 * max(np.abs(bounds)) * np.finfo(float).eps
 
         self.bounds = list(bounds)
 
         self._vdim = None
+
+    @property
+    def losses(self):
+        return self._losses._losses
+
+    @property
+    def losses_combined(self):
+        return self._losses_combined._losses
 
     @property
     def vdim(self):
@@ -283,8 +294,11 @@ class Learner1D(BaseLearner):
 
     @cache_latest
     def loss(self, real=True):
-        losses = self.losses if real else self.losses_combined
-        return max(losses.values()) if len(losses) > 0 else float('inf')
+        losses = self._losses if real else self._losses_combined
+        max_interval, max_loss = losses.peek()
+        if max_interval is None:
+            return np.inf
+        return max_loss
 
     def _scale_x(self, x):
         if x is None:
@@ -327,7 +341,7 @@ class Learner1D(BaseLearner):
             return
 
         loss = self._get_loss_in_interval(x_left, x_right)
-        self.losses[x_left, x_right] = loss
+        self._losses[x_left, x_right] = loss
 
         # Iterate over all interpolated intervals in between
         # x_left and x_right and set the newly interpolated loss.
@@ -335,7 +349,7 @@ class Learner1D(BaseLearner):
         dx = x_right - x_left
         while b != x_right:
             b = self.neighbors_combined[a][1]
-            self.losses_combined[a, b] = (b - a) * loss / dx
+            self._losses_combined[a, b] = (b - a) * loss / dx
             a = b
 
     def _update_losses(self, x, real=True):
@@ -348,7 +362,7 @@ class Learner1D(BaseLearner):
         a, b = self._find_neighbors(x, self.neighbors_combined)
 
         # (a, b) is splitted into (a, x) and (x, b) so if (a, b) exists
-        self.losses_combined.pop((a, b), None)  # we get rid of (a, b).
+        self._losses_combined.discard((a, b))  # we get rid of (a, b).
 
         if real:
             # We need to update all interpolated losses in the interval
@@ -360,27 +374,27 @@ class Learner1D(BaseLearner):
 
             # Since 'x' is in between (x_left, x_right),
             # we get rid of the interval.
-            self.losses.pop((x_left, x_right), None)
-            self.losses_combined.pop((x_left, x_right), None)
+            self._losses.discard((x_left, x_right))
+            self._losses_combined.discard((x_left, x_right))
         elif x_left is not None and x_right is not None:
             # 'x' happens to be in between two real points,
             # so we can interpolate the losses.
             dx = x_right - x_left
-            loss = self.losses[x_left, x_right]
-            self.losses_combined[a, x] = (x - a) * loss / dx
-            self.losses_combined[x, b] = (b - x) * loss / dx
+            loss = self._losses[x_left, x_right]
+            self._losses_combined[a, x] = (x - a) * loss / dx
+            self._losses_combined[x, b] = (b - x) * loss / dx
 
         # (no real point left of x) or (no real point right of a)
         left_loss_is_unknown = ((x_left is None) or
                                 (not real and x_right is None))
         if (a is not None) and left_loss_is_unknown:
-            self.losses_combined[a, x] = float('inf')
+            self._losses_combined[a, x] = float('inf')
 
         # (no real point right of x) or (no real point left of b)
         right_loss_is_unknown = ((x_right is None) or
                                  (not real and x_left is None))
         if (b is not None) and right_loss_is_unknown:
-            self.losses_combined[x, b] = float('inf')
+            self._losses_combined[x, b] = float('inf')
 
     @staticmethod
     def _find_neighbors(x, neighbors):
@@ -454,8 +468,7 @@ class Learner1D(BaseLearner):
 
         # If the scale has increased enough, recompute all losses.
         if self._scale[1] > self._recompute_losses_factor * self._oldscale[1]:
-
-            for interval in self.losses:
+            for interval in list(self._losses):
                 self._update_interpolated_loss_in_interval(*interval)
 
             self._oldscale = deepcopy(self._scale)
@@ -504,33 +517,33 @@ class Learner1D(BaseLearner):
             for neighbors in (self.neighbors, self.neighbors_combined)]
 
         # The the losses for the "real" intervals.
-        self.losses = {}
+        self._losses = LossManager(self._scale[0])
         for ival in intervals:
-            self.losses[ival] = self._get_loss_in_interval(*ival)
+            self._losses[ival] = self._get_loss_in_interval(*ival)
 
         # List with "real" intervals that have interpolated intervals inside
         to_interpolate = []
 
-        self.losses_combined = {}
+        self._losses_combined = LossManager(self._scale[0])
         for ival in intervals_combined:
             # If this interval exists in 'losses' then copy it otherwise
             # calculate it.
-            if ival in self.losses:
-                self.losses_combined[ival] = self.losses[ival]
+            if ival in self._losses:
+                self._losses_combined[ival] = self._losses[ival]
             else:
                 # Set all losses to inf now, later they might be udpdated if the
                 # interval appears to be inside a real interval.
-                self.losses_combined[ival] = np.inf
+                self._losses_combined[ival] = np.inf
                 x_left, x_right = ival
                 a, b = to_interpolate[-1] if to_interpolate else (None, None)
-                if b == x_left and (a, b) not in self.losses:
+                if b == x_left and (a, b) not in self._losses:
                     # join (a, b) and (x_left, x_right) → (a, x_right)
                     to_interpolate[-1] = (a, x_right)
                 else:
                     to_interpolate.append((x_left, x_right))
 
         for ival in to_interpolate:
-            if ival in self.losses:
+            if ival in self._losses:
                 # If this interval does not exist it should already
                 # have an inf loss.
                 self._update_interpolated_loss_in_interval(*ival)
@@ -566,61 +579,56 @@ class Learner1D(BaseLearner):
         if len(missing_bounds) >= n:
             return missing_bounds[:n], [np.inf] * n
 
-        def finite_loss(loss, xs):
-            # If the loss is infinite we return the
-            # distance between the two points.
-            if math.isinf(loss):
-                loss = (xs[1] - xs[0]) / self._scale[0]
 
-            # We round the loss to 12 digits such that losses
-            # are equal up to numerical precision will be considered
-            # equal.
-            return round(loss, ndigits=12)
 
-        quals = [(-finite_loss(loss, x), x, 1)
-                 for x, loss in self.losses_combined.items()]
 
         # Add bound intervals to quals if bounds were missing.
         if len(self.data) + len(self.pending_points) == 0:
             # We don't have any points, so return a linspace with 'n' points.
             return np.linspace(*self.bounds, n).tolist(), [np.inf] * n
-        elif len(missing_bounds) > 0:
+
+        quals = LossManager(self._scale[0])
+        if len(missing_bounds) > 0:
             # There is at least one point in between the bounds.
             all_points = list(self.data.keys()) + list(self.pending_points)
             intervals = [(self.bounds[0], min(all_points)),
                          (max(all_points), self.bounds[1])]
             for interval, bound in zip(intervals, self.bounds):
                 if bound in missing_bounds:
-                    qual = (-finite_loss(np.inf, interval), interval, 1)
-                    quals.append(qual)
+                    quals[(*interval, 1)] = np.inf
+
+
+        points_to_go = n - len(missing_bounds)
 
         # Calculate how many points belong to each interval.
-        points, loss_improvements = self._subdivide_quals(
-            quals, n - len(missing_bounds))
+        it = more_itertools.peekable(self._losses_combined.items())
+        for _ in range(points_to_go):
+            ival, loss_ival = it.peek((None, 0))
+            qual, loss_qual = quals.peek((None, 0))
 
-        points = missing_bounds + points
-        loss_improvements = [np.inf] * len(missing_bounds) + loss_improvements
+            if qual is None \
+               or (ival is not None \
+                   and self._losses_combined.finite_loss(ival) >= quals.finite_loss(qual)):
 
-        return points, loss_improvements
-
-    def _subdivide_quals(self, quals, n):
-        # Calculate how many points belong to each interval.
-        heapq.heapify(quals)
-
-        for _ in range(n):
-            quality, x, n = quals[0]
-            if abs(x[1] - x[0]) / (n + 1) <= self._dx_eps:
-                # The interval is too small and should not be subdivided.
-                quality = np.inf
-                # XXX: see https://gitlab.kwant-project.org/qt/adaptive/issues/104
-            heapq.heapreplace(quals, (quality * n / (n + 1), x, n + 1))
+                next(it) # discard the head of the iterator
+                quals[(*ival, 2)] = loss_ival / 2
+            else:
+                quals.remove(qual)
+                *xs, n = qual
+                quals[(*xs, n+1)] = loss_qual * n / (n+1)
 
         points = list(itertools.chain.from_iterable(
-            linspace(*interval, n) for quality, interval, n in quals))
+                    linspace(*ival, n)
+                    for (*ival, n) in quals))
 
         loss_improvements = list(itertools.chain.from_iterable(
-            itertools.repeat(-quality, n - 1)
-            for quality, interval, n in quals))
+            itertools.repeat(quals[x0,x1,n], n - 1)
+            for (x0, x1, n)  in quals))
+
+
+        # add the missing bounds
+        points = missing_bounds + points
+        loss_improvements = [np.inf] * len(missing_bounds) + loss_improvements
 
         return points, loss_improvements
 
@@ -650,7 +658,7 @@ class Learner1D(BaseLearner):
 
     def remove_unfinished(self):
         self.pending_points = set()
-        self.losses_combined = deepcopy(self.losses)
+        self._losses_combined = deepcopy(self._losses)
         self.neighbors_combined = deepcopy(self.neighbors)
 
     def _get_data(self):
@@ -658,3 +666,123 @@ class Learner1D(BaseLearner):
 
     def _set_data(self, data):
         self.tell_many(*zip(*data.items()))
+
+
+class LossManager:
+    """LossManager functions as an abstraction layer to keep the losses sorted
+    while performing all operations in O(1) or O(log N). The datastructure
+    behind this is a dict combined with a SortedKeyList. The advantage of this
+    abstraction is that one can make less mistakes. The lossmanager will
+    guarantee that the data stored in the SortedKeyList and the dict will stay
+    synchronized.
+
+    The intervals are sorted by their loss in descending order.
+
+    Caution when using the iterators. If you add/delete/update values in the
+    LossManager while iterating over it's items you will get undefined behaviour.
+    """
+    def __init__(self, x_scale):
+        self._losses = {}
+        self._x_scale = x_scale
+        self._sortedlist = SortedKeyList([], self._get_sort_value)
+
+    def _finite_loss(self, ival, loss):
+        # If the loss is infinite we return the
+        # distance between the two points.
+        if math.isinf(loss):
+            if len(ival) == 3:
+                loss = (ival[1] - ival[0]) / self._x_scale / ival[2]
+            else:
+                loss = (ival[1] - ival[0]) / self._x_scale
+
+        # We round the loss to 12 digits such that losses
+        # are equal up to numerical precision will be considered
+        # equal.
+        return round(loss, ndigits=12)
+
+    def finite_loss(self, ival):
+        """Get the socalled finite_loss of an interval in order to be able to
+        sort intervals that have infinite loss."""
+        loss = self[ival]
+        return self._finite_loss(ival, loss)
+
+    def _get_sort_value(self, ival):
+        return self.finite_loss(ival), ival
+
+    def discard(self, interval):
+        """Remove interval from the LossManager, do nothing if interval
+        not present"""
+        if interval not in self._losses:
+            return
+        self._sortedlist.discard(interval)
+        self._losses.pop(interval, None)
+
+    def remove(self, interval):
+        """Remove interval from the LossManager, raises exception if interval
+        not present"""
+        self._sortedlist.remove(interval)
+        del self._losses[interval]
+
+    def add(self, interval, loss):
+        """Add new interval to the LossManager, raises exception if already present"""
+        if interval in self._losses:
+            raise KeyError(f"Cannot add {interval}, already present")
+        self._losses[interval] = loss
+        self._sortedlist.add(interval)
+
+    def get(self, interval):
+        """Get the loss of an interval"""
+        return self._losses[interval]
+
+    def __getitem__(self, interval):
+        """Get the loss of an interval"""
+        return self.get(interval)
+
+    def __setitem__(self, interval, loss):
+        """Set the loss of an interval"""
+        self.discard(interval)
+        self.add(interval, loss)
+
+    def pop(self):
+        """Get the tuple (interval, loss) of the interval with the highest loss
+        and remove this interval from the LossManager."""
+        interval = self._sortedlist.pop()
+        loss = self._losses.pop(interval)
+        return interval, loss
+
+    def peek(self, default=(None, 0)):
+        """Get the tuple (interval, loss) of the interval with the highest loss
+        without changing the internal state."""
+        if len(self) == 0:
+            return default
+        interval = self._sortedlist[-1]
+        loss = self._losses[interval]
+        return interval, loss
+
+    def __iter__(self):
+        """Iterator over the intervals in order of descending loss"""
+        return reversed(self._sortedlist)
+
+    def __contains__(self, interval):
+        """Check whether an interval is in the LossManager"""
+        return interval in self._losses
+
+    def __repr__(self):
+        return f"LossManager({self._losses})"
+
+    def __len__(self):
+        return len(self._losses)
+
+    def items(self):
+        """Iterator over the intervals, will yield a tuple (interval, loss)"""
+        for ival in self:
+            yield ival, self[ival]
+
+    def __eq__(self, other):
+        """Check whether two LossManagers are equal, can also compare to a dict
+        to see if the intervals and losses are equal."""
+        if isinstance(other, LossManager):
+            return other._x_scale == self._x_scale and other._losses == self._losses
+
+        if isinstance(other, dict):
+            return other == self._losses

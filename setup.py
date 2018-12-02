@@ -25,6 +25,7 @@ version, cmdclass = get_version_and_cmdclass('adaptive')
 
 
 install_requires = [
+    'more-itertools',
     'scipy',
     'sortedcontainers',
 ]
